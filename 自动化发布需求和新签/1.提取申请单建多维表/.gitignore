@@ -1,0 +1,12 @@
+# 环境变量 / 密钥
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# 临时文件
+~$*
+
+# 下载目录
+downloads/

@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python main.py --dry-run)",
+      "Bash(python main.py -y)",
+      "Bash(python main.py)"
+    ]
+  }
+}
