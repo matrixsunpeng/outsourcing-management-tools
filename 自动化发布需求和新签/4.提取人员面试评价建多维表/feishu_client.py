@@ -39,10 +39,21 @@ class FeishuBitableClient:
         }
 
     def create_table_if_needed(self) -> str:
-        """Create the bitable if it doesn't exist. Returns bitable_id."""
+        """Create the bitable if it doesn't exist. Returns bitable_id.
+
+        If FEISHU_BITABLE_ID is set in .env but the table has been deleted
+        from Feishu, it will be auto-detected and a new table created.
+        """
         bitable_id = self.config.FEISHU_BITABLE_ID
         if bitable_id:
-            return bitable_id
+            if self._bitable_exists(bitable_id):
+                return bitable_id
+            else:
+                print(f"[飞书] 多维表 {bitable_id} 已不存在（可能被删除），将创建新表")
+                # Clear the stale ID so a new one is created
+                self._clear_saved_bitable_id()
+                self.config.FEISHU_BITABLE_ID = ""
+                bitable_id = ""
 
         base = self.config.FEISHU_BITABLE_BASE
         resp = requests.post(
@@ -62,6 +73,34 @@ class FeishuBitableClient:
         self._save_bitable_id(bitable_id)
         self.config.FEISHU_BITABLE_ID = bitable_id
         return bitable_id
+
+    def _bitable_exists(self, bitable_id: str) -> bool:
+        """Check whether a bitable still exists on Feishu."""
+        try:
+            base = self.config.FEISHU_BITABLE_BASE
+            resp = requests.get(
+                f"{base}/apps/{bitable_id}",
+                headers=self._headers(),
+                timeout=15,
+            )
+            return resp.json().get("code") == 0
+        except Exception:
+            return False
+
+    def _clear_saved_bitable_id(self):
+        """Remove stale FEISHU_BITABLE_ID from .env file."""
+        import os
+        env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            with open(env_path, "w", encoding="utf-8") as f:
+                for line in lines:
+                    if not line.startswith("FEISHU_BITABLE_ID="):
+                        f.write(line)
+            print("[飞书] 已清除 .env 中的旧 FEISHU_BITABLE_ID")
+        except Exception as e:
+            print(f"[飞书] 清除旧 BITABLE_ID 失败: {e}")
 
     def _save_bitable_id(self, bitable_id: str):
         """Save bitable_id to .env file for future use."""

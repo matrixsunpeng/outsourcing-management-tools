@@ -44,7 +44,7 @@ def navigate_to_query_task(page: Page) -> Page:
     # 点击 "查询招聘任务"
     _click_menu_item(page, "查询招聘任务")
 
-    page.wait_for_load_state("networkidle", timeout=15000)
+    page.wait_for_load_state("domcontentloaded", timeout=10000)
     page.wait_for_timeout(2000)
     print("  导航完成")
     return page
@@ -89,15 +89,12 @@ def _click_menu_item(page: Page, text: str):
         print(f"  [WARN] 未找到 '{text}' 菜单")
 
 
-def set_filters_and_search(page: Page) -> Page:
+def set_filters_and_search(page: Page, bu_values: list[str] = None) -> Page:
     """
     在查询招聘任务页面设置筛选条件并查询。
-    - 点击"展开"按钮显示全部筛选条件
-    - 发布状态: 选"已发布"
-    - 聘用形式: 选"外包"
-    - 所属BU: 选"185(亚信科技CMB)"
-    - 点击"查询"
+    bu_values: BU 筛选值列表，如 ["185"] 或 ["亚信科技CTC"]
     """
+    bu_values = bu_values or ["185"]
     print("  正在设置筛选条件...")
 
     # 1. 点击"展开"按钮
@@ -110,14 +107,18 @@ def set_filters_and_search(page: Page) -> Page:
     except Exception:
         pass
 
-    # 2. 发布状态 → 选"已发布"（radio/checkbox 组，通常是第2个选项）
+    # 2. 发布状态 → 选"已发布"
     _select_filter_option(page, "已发布")
 
-    # 3. 聘用形式 → 选"外包"（通常是第4个选项）
-    _select_filter_option(page, "外包")
+    # 3. 招聘任务状态 → 选中"未开始"和"进行中"（多选）
+    _select_filter_option(page, "未开始")
+    _select_filter_option(page, "进行中")
 
-    # 4. 所属BU → 输入/选择 "185"
-    _select_bu(page, "185")
+    # 4. 所属BU → 使用传入的 BU 值
+    if len(bu_values) == 1:
+        _select_bu(page, bu_values[0])
+    else:
+        print(f"  多 BU 模式 ({', '.join(bu_values)})，跳过 BU 筛选")
 
     # 关闭可能残留的下拉框
     page.keyboard.press("Escape")
@@ -158,7 +159,7 @@ def set_filters_and_search(page: Page) -> Page:
         except Exception as e:
             print(f"  [WARN] 点击查询失败: {e}")
 
-    page.wait_for_load_state("networkidle", timeout=15000)
+    page.wait_for_load_state("domcontentloaded", timeout=10000)
     page.wait_for_timeout(3000)
     print("  查询完成，等待结果加载...")
     return page
@@ -336,80 +337,120 @@ def _search_and_match(page: Page, application_code: str, publish_time_str: str, 
     在当前页面查找目标申请单编号，提取关联的职位编号和创建时间，验证后返回。
     """
     match_data = page.evaluate(f"""() => {{
-        var result = {{position_codes: [], creation_time: ''}};
+        var entries = [];
+        var seenMarkers = {{}};
 
-        // 在页面上找所有包含目标申请单编号的文本节点
-        var walker = document.createTreeWalker(
-            document.body,
-            NodeFilter.SHOW_TEXT,
-            null,
-            false
-        );
+        var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
         var node;
         while (node = walker.nextNode()) {{
             if (node.textContent.indexOf('{application_code}') === -1) continue;
 
-            // 从这个节点向上找包含"职位编号"和"创建时间"的容器
             var el = node.parentElement;
             for (var level = 0; level < 15; level++) {{
                 if (!el || el === document.body) break;
                 var text = el.textContent || '';
 
-                // 确认这个容器里同时有申请单号、创建时间
-                if (text.indexOf('外包申请单编号') !== -1 && text.indexOf('创建时间') !== -1) {{
-                    // 提取职位编号（可能有多个）
-                    var posRegex = /职位编号[：:]\\s*(\\d+)/g;
-                    var pm;
-                    while ((pm = posRegex.exec(text)) !== null) {{
-                        if (result.position_codes.indexOf(pm[1]) === -1) {{
-                            result.position_codes.push(pm[1]);
+                if (text.indexOf('职位编号') !== -1 && text.indexOf('创建时间') !== -1) {{
+                    // 检查是否已处理过此容器（去重）
+                    var key = text.substring(0, 100);
+                    if (seenMarkers[key]) break;
+                    seenMarkers[key] = true;
+
+                    var pm = text.match(/职位编号[：:]\\s*(\\d+)/);
+                    var tm = text.match(/创建时间[：:]\\s*(\\d{{4}}[-/]\\d{{1,2}}[-/]\\d{{1,2}}\\s+\\d{{1,2}}:\\d{{2}}(?::\\d{{2}})?)/);
+                    if (!pm) break;
+
+                    // 标记此条目的"查看"按钮
+                    var marker = 'entry_' + entries.length;
+                    var btns = el.querySelectorAll('button, a, span');
+                    for (var b of btns) {{
+                        if (b.textContent.trim() === '查看') {{
+                            b.setAttribute('data-entry-marker', marker);
+                            break;
                         }}
                     }}
 
-                    // 提取创建时间
-                    var tm = text.match(/创建时间[：:]\\s*(\\d{{4}}[-/]\\d{{1,2}}[-/]\\d{{1,2}}\\s+\\d{{1,2}}:\\d{{2}}(?::\\d{{2}})?)/);
-                    if (tm) {{
-                        result.creation_time = tm[1];
-                    }}
-
-                    if (result.position_codes.length > 0) {{
-                        return result;
-                    }}
+                    entries.push({{
+                        marker: marker,
+                        position_code: pm[1],
+                        creation_time: tm ? tm[1] : ''
+                    }});
+                    break;
                 }}
                 el = el.parentElement;
             }}
         }}
-        return result;
+        return entries;
     }}""")
 
-    position_codes = match_data.get("position_codes", [])
-    creation_time = match_data.get("creation_time", "")
+    entries = match_data if isinstance(match_data, list) else []
 
-    if not position_codes:
+    if not entries:
         return ""
 
-    print(f"    找到职位编号: {position_codes}, 创建时间: {creation_time}")
+    print(f"    找到 {len(entries)} 个职位条目")
 
-    # 时间校验
-    if publish_time_str and creation_time:
-        if not _is_time_within_10_minutes(publish_time_str, creation_time):
-            print(f"      时间不匹配: 记录发布时间={publish_time_str}, 页面创建时间={creation_time}")
-            return ""
-        print(f"      时间匹配: 发布时间≈创建时间({creation_time})")
+    # 逐条校验时间+供应商，返回第一个三项全匹配的职位编号
+    for i, entry in enumerate(entries):
+        pos_code = entry.get("position_code", "")
+        ct = entry.get("creation_time", "")
+        marker = entry.get("marker", "")
 
-    # 供应商校验：以申请单编号定位区域 → 点击"查看" → 提取供应商名称
-    if supplier:
-        page_supplier = _check_supplier(page, application_code)
-        if page_supplier:
-            safe = page_supplier.replace('\xa0', ' ').replace('　', ' ')
-            if supplier in page_supplier or page_supplier in supplier:
-                print(f"      供应商匹配: {supplier}")
+        # 时间校验
+        if publish_time_str and ct:
+            if not _is_time_within_10_minutes(publish_time_str, ct):
+                print(f"      条目{i+1} 职位{pos_code}: 时间不匹配(创建={ct})")
+                continue
+
+        # 供应商校验
+        if supplier and marker:
+            page_supplier = _get_supplier_by_marker(page, marker)
+            if page_supplier:
+                safe = page_supplier.replace('\xa0', ' ').replace('　', ' ')
+                if supplier in safe or safe in supplier:
+                    print(f"      条目{i+1} 职位{pos_code}: 时间={ct[:16]}, 供应商匹配({supplier})")
+                    return pos_code
+                else:
+                    print(f"      条目{i+1} 职位{pos_code}: 供应商不匹配(期望={supplier}, 实际={safe[:60]})")
             else:
-                print(f"      [WARN] 供应商不一致: 记录=[{supplier}], 页面内容=[{safe[:100]}]（不阻断匹配）")
-        else:
-            print(f"      [WARN] 无法获取供应商信息，跳过校验（不阻断匹配）")
+                print(f"      条目{i+1} 职位{pos_code}: 无法获取供应商")
+        elif not supplier:
+            print(f"      条目{i+1} 职位{pos_code}: 时间={ct[:16]}")
+            return pos_code
 
-    return ",".join(position_codes)
+    return ""
+
+
+def _get_supplier_by_marker(page: Page, marker: str) -> str:
+    """点击 data-entry-marker=marker 的"查看"按钮，提取供应商名称"""
+    btn = page.locator(f'[data-entry-marker="{marker}"]').first
+    if btn.count() == 0:
+        return ""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(200)
+        btn.click()
+        page.wait_for_timeout(1500)
+    except Exception:
+        return ""
+
+    supplier = page.evaluate("""() => {
+        const pops = document.querySelectorAll('.ant-popover .ant-popover-inner, '
+            + '.ant-tooltip .ant-tooltip-inner, .ant-modal .ant-modal-body, '
+            + '[class*=popover] [class*=content], [class*=bubble]');
+        for (const p of pops) {
+            if (p.offsetParent === null) continue;
+            const text = (p.textContent || '').trim();
+            if (text.length >= 2 && text.length <= 100) return text;
+        }
+        return '';
+    }""")
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(300)
+    except Exception:
+        pass
+    return supplier.strip() if supplier else ""
 
 
 def _check_supplier(page: Page, application_code: str) -> str:
@@ -652,7 +693,7 @@ def _go_to_page(page: Page, page_num: int) -> bool:
                                 f'li:has-text("{page_num}")').first
         if page_btn.is_visible(timeout=3000):
             page_btn.click()
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
             page.wait_for_timeout(2000)
             print(f"  已翻到第{page_num}页")
             return True

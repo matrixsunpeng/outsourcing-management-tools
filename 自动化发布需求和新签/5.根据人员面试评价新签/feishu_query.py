@@ -88,7 +88,7 @@ def query_unsigned_records(config_path: str = None) -> list[dict]:
             is_signed = str(rec.get(keys[20], "")).strip()
         if len(keys) > 9:
             app_code = str(rec.get(keys[9], "")).strip()
-        if is_signed != '是':
+        if is_signed == '否':
             if not app_code or app_code == 'None':
                 skipped_empty += 1
                 continue

@@ -168,3 +168,152 @@ download.delete()  # 清理 Playwright 内部临时文件
 ```
 
 流程末尾有兜底清理：扫描工作目录删除 UUID 格式命名的残留文件（`download_and_parse.py`）。
+
+## gui_app.py — 图形化工作界面
+
+`gui_app.py` 替代 `quick_start.py` 的终端交互，提供 tkinter GUI 表单 + 实时日志输出。双击即可运行。
+
+### 架构
+
+```
+gui_app.py (tkinter 主线程)
+  ├─ 参数表单（模式选择 / 凭据 / 日期 / SBU / 选项 / 文件路径）
+  ├─ subprocess.Popen("python -u main.py ...")
+  │     ├─ _read_output() 线程：stdout.read(4096) → 解码 → queue.Queue
+  │     └─ _wait_process() 线程：等待进程结束
+  ├─ _drain_log_queue()：主线程 root.after(80ms) 定时排空队列 → 更新 ScrolledText
+  └─ 确认对话框：检测 main.py "是否继续？(y/n)" 提示 → messagebox.askyesno → 写 stdin
+```
+
+### 子进程实时日志的五个坑（2026-06-10 ~ 2026-06-11）
+
+**坑1：stdout 全缓冲（日志堆积到进程结束才显示）**
+
+Python 检测到 stdout 是管道（非终端）时，自动切换到 8KB 全缓冲模式。`logging.StreamHandler` 虽每次 `emit()` 后调 `flush()`，但 C 层缓冲不受影响。
+
+解决三管齐下：
+- 命令行加 `-u` 参数：`python -u main.py ...`
+- 环境变量 `PYTHONUNBUFFERED=1`
+- `subprocess.Popen` 用二进制模式 `bufsize=0`（跳过 TextIOWrapper 额外缓冲层），手动 `decode("utf-8", errors="replace")`
+
+```python
+# 正确：二进制无缓冲管道
+self._proc = subprocess.Popen(
+    cmd,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    stdin=subprocess.PIPE,
+    bufsize=0,  # 二进制模式无缓冲
+    env={"PYTHONIOENCODING": "utf-8", "PYTHONUNBUFFERED": "1", **os.environ},
+)
+# 读取端手动解码
+raw = self._proc.stdout.read(4096)
+text = raw.decode("utf-8", errors="replace")
+```
+
+**坑2：`main.py` 在 `input()` 处阻塞**
+
+`main.py` 的 `--audit-date` 未传命令行参数时，会进入交互式 `input()` 等待用户输入。GUI 子进程的 stdin 是管道，`input()` 永远等不到输入 → 进程阻塞。
+
+解决：GUI 始终传递 `--audit-date`，留空时 fallback 到结束日期（与 `quick_start.py` 行为一致）。
+
+**坑3：中文乱码（Windows GBK 环境）**
+
+Windows 中文环境子进程默认输出 GBK 编码，GUI 用 UTF-8 解码导致 `��ǩ�Զ��µ�` 乱码。
+
+解决：设置 `PYTHONIOENCODING=utf-8` 环境变量强制子进程输出 UTF-8。
+
+**坑4：tkinter `after(0, callback)` 逐行回调淹没事循环**
+
+子进程实时产出大量日志行时，每行一个 `root.after(0, _append_log, line)` 会淹没 tkinter 事件队列，UI 来不及渲染。
+
+解决：改为生产者-消费者模式：
+- 读取线程推入 `queue.Queue`
+- 主线程 `root.after(80, _drain_log_queue)` 每 80ms 排空队列，批量更新 ScrolledText
+
+### `--audit-date` 传递约定
+
+`gui_app.py` 在模式 ①/② 时**始终传递** `--audit-date`。用户未填写稽核时间时，自动使用结束日期的值。这避免了 `main.py` 进入 `input()` 交互阻塞。
+
+### 确认对话框机制
+
+`main.py` 模式 ①（完整流程）在下载完成后、下单前会输出 `[确认] 将执行自动下单流程，是否继续？(y/n): ` 提示。GUI 的 `_read_output` 线程检测到 `是否继续？(y/n)` 关键词后，在队列中放入 `("confirm", None)` 事件，`_drain_log_queue` 在主线程弹出 `messagebox.askyesno` 让用户选择。
+
+`_confirm_shown` 标志防止同一确认提示被检测多次（因分块读取可能触发多次匹配）。每次启动新进程时重置该标志。
+
+**坑5：`input()` 确认提示无尾部换行符，残留 buffer 不被检测（2026-06-11）**
+
+`main.py` 的确认提示通过 `input()` 输出，格式为 `\n[确认] 将执行自动下单流程，是否继续？(y/n): `。`input()` 在末尾**不加换行符**。`_read_output` 中按 `\n` 拆分行时，`[确认]...` 这部分残留在 buffer 中无换行符结尾，旧代码只在完整行（以 `\n` 结尾）中检测确认关键词，导致永远不触发弹窗，子进程在 `input()` 处永久阻塞。
+
+解决：在每次 `read(4096)` 后，除按 `\n` 拆分行检测外，**额外检查残留 buffer** 中是否包含确认关键词。
+
+```python
+# 检测残留在 buffer 中的确认提示（input() 提示不含尾部换行符）
+if any(kw in buf for kw in confirm_keywords) and self._proc:
+    self._log_queue.put(("confirm", None))
+```
+
+## 打包为独立 .exe（PyInstaller）
+
+### 单 exe 双模式架构
+
+打包后的 `续签自动下单.exe` 支持两种运行模式：
+- **GUI 模式**（直接双击）：正常显示图形界面
+- **Worker 模式**（`--internal-worker` 参数）：GUI 点击"开始执行"时，启动自身 exe 的新实例作为子进程，直接调用 `main.py` 的 `main()` 函数
+
+### Worker 模式编码问题（2026-06-11）
+
+PyInstaller 打包后，`PYTHONIOENCODING=utf-8` 环境变量传递给子进程可能不生效，`sys.stdout.encoding` 仍为 GBK，导致日志中文乱码。
+
+解决：在 `--internal-worker` 入口处直接调用 `sys.stdout.reconfigure(encoding='utf-8')`，不依赖环境变量。
+
+```python
+if "--internal-worker" in sys.argv:
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
+    ...
+```
+
+```
+续签自动下单.exe (GUI)
+  └─ subprocess.Popen("续签自动下单.exe --internal-worker --username ...")
+       └─ from main import main; main()
+```
+
+### 构建命令
+
+```bash
+cd "F:\ClaudeCode\外包工具箱\自动化续签下单"
+python -m PyInstaller gui_app.spec --noconfirm
+# 输出: dist/续签自动下单.exe (~80MB)
+```
+
+### .spec 关键配置
+
+- `console=False`：双击不显示黑窗口
+- `excludes`：排除不相关的大型包（torch, scipy, matplotlib 等），防止体积膨胀
+- `datas`：将 `utils/`、`下载外包续签查询/`、`下载人员变更/` 子目录打包到 MEIPASS
+- `strip=False, upx=False`：Windows 下 strip 命令不可用，须关闭
+
+### Playwright 浏览器依赖
+
+打包后的 .exe 使用 `channel="chrome"` 调用**系统已安装的 Chrome**，不再依赖 Playwright 自带的 chromium。同事电脑只需安装 Chrome 即可运行。
+
+### 设置文件
+
+frozen 模式下 `.gui_settings.json` 保存在 exe 同级目录，而非 MEIPASS 内部（后者只读）。
+
+### 分享给同事
+
+1. 将 `dist/续签自动下单.exe` 复制给同事
+2. 同事需安装 **Google Chrome** 浏览器
+3. 首次运行可能被杀毒软件拦截，需添加信任
+4. IMS 内网环境需能连接（VPN 等）
+
+### 修改过的文件（channel="chrome" 适配）
+
+- `下载外包续签查询/renewal_query_downloader.py:60` — `chromium.launch(..., channel="chrome")`
+- `下载人员变更/personnel_change_downloader.py:57` — 同上

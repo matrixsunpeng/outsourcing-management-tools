@@ -7,7 +7,22 @@ from datetime import date, timedelta
 QUERY_DAYS_BACK = 7
 TECH_COOP_TYPE_INDEX = 2   # 下拉框第3项(0-based index 2): 技术合作-||(人员类)
 APP_STATE_VALUE = "40"      # 审批流程结束 的 itemCode
-SBU_VALUE = "185"           # 亚信科技CMB 的 flexValue
+SBU_VALUE = ""             # 运行时通过 --sbu 参数或环境变量 SBU_VALUES 设置，默认 "185"
+
+
+def parse_sbu_values(raw: str) -> list[str]:
+    """解析逗号分隔的 SBU 代码，支持中英文逗号，去空白去重"""
+    if not raw:
+        return ["185"]
+    raw = raw.replace("，", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    seen = set()
+    result = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
 
 # ==================== 飞书多维表字段定义 ====================
 # type: text=文本, number=数字, datetime=日期, checkbox=是/否

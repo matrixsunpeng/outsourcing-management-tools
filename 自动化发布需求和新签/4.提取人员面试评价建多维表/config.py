@@ -27,7 +27,7 @@ class Config:
     # Query defaults: last N days
     QUERY_DAYS_BACK = 7
     QUERY_STATUS = "审批通过"
-    QUERY_BU = "(185)亚信科技CMB"
+    QUERY_BU = os.getenv("QUERY_BU", "(185)亚信科技CMB")
 
     # Allowed suppliers (fuzzy match)
     ALLOWED_SUPPLIERS = [

@@ -7,7 +7,9 @@
 5. 将职位编号更新回多维表
 
 用法:
-  python main.py
+  python main.py               # 默认 BU=185
+  python main.py --bu 185      # 单个 BU
+  python main.py --bu 185,186  # 多个 BU（中英文逗号均可）
 """
 
 import os
@@ -17,6 +19,33 @@ from dotenv import dotenv_values
 
 sys.stdout.reconfigure(line_buffering=True)
 
+
+def secure_input(prompt="密码: "):
+    """密码输入 — Windows 显示 * 回显，其他平台用 getpass"""
+    if sys.platform == "win32":
+        import msvcrt
+        print(prompt, end="", flush=True)
+        password = ""
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\r", b"\n"):
+                print()
+                break
+            elif ch == b"\x08":
+                if password:
+                    password = password[:-1]
+                    print("\b \b", end="", flush=True)
+            elif ch == b"\x03":
+                raise KeyboardInterrupt()
+            else:
+                password += ch.decode("utf-8", errors="ignore")
+                print("*", end="", flush=True)
+        return password
+    else:
+        import getpass
+        return getpass.getpass(prompt)
+
+
 from playwright.sync_api import sync_playwright
 
 from feishu_query import query_records_needing_position
@@ -24,9 +53,42 @@ from feishu_update import update_position_code
 from tam_query import navigate_to_query_task, set_filters_and_search, find_position_for_record
 
 
+def _extract_bu_code(sbu_name: str) -> str:
+    """从事业部/SBU 名称提取 BU 代码，如 '亚信科技CTC' → '121'"""
+    sbu_upper = sbu_name.upper().strip()
+    # 已知映射
+    if "CTC" in sbu_upper:
+        return "121"
+    if "CMB" in sbu_upper:
+        return "185"
+    if "CUC" in sbu_upper:
+        return "186"
+    # 尝试从名称开头提取数字（如 "(121)亚信科技CTC"）
+    import re
+    m = re.match(r'\(?(\d+)\)?', sbu_name.strip())
+    if m:
+        return m.group(1)
+    return "185"  # 默认 CMB
+
+
+def parse_bu_values(raw: str) -> list[str]:
+    """解析逗号分隔的 BU 代码，支持中英文逗号，去空白去重"""
+    if not raw:
+        return ["185"]
+    raw = raw.replace("，", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    seen = set()
+    result = []
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            result.append(p)
+    return result
+
+
 def create_browser_context(playwright):
     """启动浏览器"""
-    browser = playwright.chromium.launch(headless=False)
+    browser = playwright.chromium.launch(headless=False, channel="chrome")
     context = browser.new_context(accept_downloads=True)
     page = context.new_page()
     return browser, context, page
@@ -35,7 +97,7 @@ def create_browser_context(playwright):
 def login_tam(page, username, password):
     """登录 TAM 网站"""
     print("  正在访问 TAM 网站...")
-    page.goto("https://tam.asiainfo.com/webapps/ai-hr-tam-web/", wait_until="networkidle", timeout=60000)
+    page.goto("https://tam.asiainfo.com/webapps/ai-hr-tam-web/", wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(3000)
 
     current_url = page.url
@@ -111,22 +173,41 @@ def login_tam(page, username, password):
 
 
 def main():
-    print("=" * 60)
-    print(f"查找需求返回职位编号 - 开始运行 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 60)
+    # 解析命令行参数
+    import argparse
+    parser = argparse.ArgumentParser(description="查找需求返回职位编号")
+    parser.add_argument("--bu", default=os.getenv("BU_VALUES", "185"),
+                        help="BU 代码，多个用逗号分隔（默认 185）")
+    parser.add_argument("--username", default="", help="IMS 登录用户名")
+    parser.add_argument("--password", default="", help="IMS 登录密码")
+    args, unknown = parser.parse_known_args()
+
+    bu_values = parse_bu_values(args.bu)
 
     # 加载配置
     config_path = os.path.join(os.path.dirname(__file__), "config.env")
     config = dotenv_values(config_path)
 
-    username = config.get("IMS_USERNAME", "")
-    password = config.get("IMS_PASSWORD", "")
+    username = args.username or config.get("IMS_USERNAME", "")
+    password = args.password or config.get("IMS_PASSWORD", "")
+
+    if not username:
+        username = input("IMS 用户名: ").strip()
+    if not password:
+        password = secure_input("IMS 密码: ").strip()
+
+    if not username or not password:
+        print("[ERROR] 用户名和密码不能为空")
+        sys.exit(1)
+
     bitable_token = config.get("BITABLE_TOKEN", "")
     table_id = config.get("TABLE_ID", "tblR7HsWVzDka9AS")
 
-    if not username or not password:
-        print("[ERROR] 请先在 config.env 中填写 IMS_USERNAME 和 IMS_PASSWORD")
-        sys.exit(1)
+    print("=" * 60)
+    print(f"查找需求返回职位编号 - 开始运行 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"默认 BU: {', '.join(bu_values)}（优先使用记录自身的 事业部/SBU）")
+    print("=" * 60)
+
     if not bitable_token:
         print("[ERROR] 请先在 config.env 中填写 BITABLE_TOKEN")
         sys.exit(1)
@@ -157,21 +238,31 @@ def main():
         try:
             page = login_tam(page, username, password)
 
-            # Step 3: 导航到查询招聘任务页面并设置筛选条件
+            # Step 3: 导航到查询招聘任务页面
             print("\n[Step 3] 导航到查询招聘任务页面")
             page = navigate_to_query_task(page)
 
-            print("\n[Step 4] 设置筛选条件并查询")
-            page = set_filters_and_search(page)
-
-            # Step 5: 逐条记录查找职位编号
+            # Step 4: 逐条记录查找职位编号（每条用自身的 BU 重新筛选查询）
             found_count = 0
             not_found_count = 0
+            last_bu = None
 
             for idx, record in enumerate(pending_records):
                 code = str(record.get("合作申请单编号", "")).strip()
+                sbu = str(record.get("事业部/SBU", "")).strip()
+
+                # 用多维表记录的 事业部/SBU 文本直接查询（如 "亚信科技CTC"）
+                record_bu = sbu if sbu else bu_values[0]
+
                 print(f"\n[Step 5.{idx + 1}] 查找记录: {code}")
+                print(f"    事业部/SBU: {sbu} → BU={record_bu}")
                 print("-" * 40)
+
+                # BU 变化时重新筛选查询
+                if record_bu != last_bu:
+                    print(f"    重新设置 BU={record_bu} 筛选条件...")
+                    page = set_filters_and_search(page, [record_bu])
+                    last_bu = record_bu
 
                 try:
                     position_codes = find_position_for_record(page, record)

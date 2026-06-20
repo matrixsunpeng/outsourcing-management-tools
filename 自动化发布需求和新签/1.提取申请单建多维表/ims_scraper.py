@@ -19,7 +19,6 @@ IMS_URL = "https://ims.asiainfo.com/AIOMS/Jsp/main.jsp"
 IMS_USERNAME = os.getenv("IMS_USERNAME", "")
 IMS_PASSWORD = os.getenv("IMS_PASSWORD", "")
 
-SBU_VALUE = "185"          # 亚信科技CMB flexValue
 COOP_TYPE_INDEX = 2        # 技术合作-||(人员类)
 APP_STATE_ITEMCODE = "40"  # 审批流程结束 itemCode
 
@@ -38,8 +37,11 @@ POPUP_FIELDS = [
 
 
 class IMSScraper:
-    def __init__(self, headless=False):
+    def __init__(self, headless=False, sbu_values=None, username=None, password=None):
         self.headless = headless
+        self.sbu_values = sbu_values or ["185"]
+        self.username = username or IMS_USERNAME
+        self.password = password or IMS_PASSWORD
         self.browser = None
         self.page = None
         self.playwright = None
@@ -48,7 +50,7 @@ class IMSScraper:
 
     def start(self):
         self.playwright = sync_playwright().start()
-        self.browser = self.playwright.chromium.launch(headless=self.headless)
+        self.browser = self.playwright.chromium.launch(headless=self.headless, channel="chrome")
         context = self.browser.new_context(
             viewport={"width": 1366, "height": 768},
             accept_downloads=True,
@@ -59,19 +61,26 @@ class IMSScraper:
     # ==================== 登录 ====================
     def login(self):
         print("[IMS] 登录...")
-        self.page.goto(IMS_URL, wait_until="networkidle", timeout=30000)
+        self.page.goto(IMS_URL, wait_until="domcontentloaded", timeout=30000)
+        print(f"[IMS] 当前 URL: {self.page.url}")
         if "sso.asiainfo.com" in self.page.url:
-            self.page.fill("input[name='username']", IMS_USERNAME)
-            self.page.fill("input[name='password']", IMS_PASSWORD)
+            print("[IMS] 检测到 SSO 登录页，填写凭据...")
+            self.page.fill("input[name='username']", self.username)
+            self.page.fill("input[name='password']", self.password)
             try:
                 cb = self.page.locator("input#agreement")
                 if cb.is_visible(timeout=1000) and not cb.is_checked():
                     cb.check()
             except Exception:
                 pass
-            self.page.click("input[name='submit']")
-            self.page.wait_for_timeout(8000)
+            # 用 JS click 绕过 Playwright 的导航等待（SSO 跳转可能超时）
+            self.page.locator("input[name='submit']").evaluate("el => el.click()")
+            self.page.wait_for_timeout(10000)
+            print(f"[IMS] 登录后 URL: {self.page.url}")
+        else:
+            print("[IMS] 未检测到 SSO 登录页，可能已登录或网络不通")
         if "login" in self.page.url.lower() or "sso" in self.page.url:
+            print(f"[IMS] 仍在登录页，登录失败。URL: {self.page.url}")
             raise RuntimeError("登录失败")
         print("[IMS] 登录完成")
 
@@ -104,10 +113,11 @@ class IMSScraper:
         print("[IMS] 已进入申请单查询页面")
 
     # ==================== 导出 Excel ====================
-    def export_excel(self, date_start, date_end):
+    def export_excel(self, date_start, date_end, sbu_value=None):
         """设置查询条件 → 点查询 → 导出 Excel"""
+        sbu = sbu_value or self.sbu_values[0]
         tf = self._query_frame
-        print(f"[IMS] 设置查询条件: {date_start}~{date_end}")
+        print(f"[IMS] 设置查询条件: {date_start}~{date_end}, SBU={sbu}")
 
         # 清理旧下载文件
         for f in DOWNLOAD_DIR.glob("*.xls*"):
@@ -123,7 +133,7 @@ class IMSScraper:
                 mini.get("p_apply_end_date").setValue("{date_end}");
                 mini.get("p_coop_type").select({COOP_TYPE_INDEX});
                 mini.get("p_app_state").select(4);
-                mini.get("p_sbu_id").setValue("{SBU_VALUE}");
+                mini.get("p_sbu_id").setValue("{sbu}");
             }})()
         """)
 
@@ -626,17 +636,40 @@ class IMSScraper:
             self.playwright.stop()
 
 
-def run_full_extraction(date_start, date_end):
-    """完整提取流程"""
-    scraper = IMSScraper(headless=False)
+def run_full_extraction(date_start, date_end, sbu_values=None, username=None, password=None):
+    """完整提取流程，支持多 SBU 循环查询"""
+    sbu_values = sbu_values or ["185"]
+    scraper = IMSScraper(headless=False, sbu_values=sbu_values, username=username, password=password)
     try:
         scraper.start()
         scraper.login()
         scraper.navigate_to_query()
 
-        # Step 1: 导出并筛选
-        scraper.export_excel(date_start, date_end)
-        records = scraper.parse_and_filter_excel()
+        # Step 1: 对每个 SBU 导出并筛选，合并记录
+        all_records = []
+        for idx, sbu in enumerate(sbu_values):
+            if idx == 0:
+                scraper.navigate_to_query()
+            else:
+                scraper._reenter_query_page()
+            scraper.export_excel(date_start, date_end, sbu_value=sbu)
+            records = scraper.parse_and_filter_excel()
+            all_records.extend(records)
+            print(f"[IMS] SBU={sbu}: 筛选出 {len(records)} 条新签记录")
+
+        # 按合作申请单编号去重
+        seen = set()
+        unique_records = []
+        for r in all_records:
+            code = r.get("合作申请单编号", "")
+            if code and code not in seen:
+                seen.add(code)
+                unique_records.append(r)
+        dupes = len(all_records) - len(unique_records)
+        if dupes > 0:
+            print(f"[IMS] 跨 SBU 去重: 跳过 {dupes} 条重复记录")
+        records = unique_records
+
         if not records:
             print("[IMS] 无新签记录")
             return []

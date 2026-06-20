@@ -57,7 +57,10 @@ class RenewalQueryDownloader:
 
     def start(self) -> None:
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=self.headless, args=["--headless=new"] if self.headless else [])
+        self._browser = self._playwright.chromium.launch(
+            headless=self.headless,
+            channel="chrome",
+            args=["--headless=new"] if self.headless else [])
         context = self._browser.new_context(accept_downloads=True)
         self._page = context.new_page()
         print(f"[INFO] 浏览器已启动，下载目录: {self.download_dir}")

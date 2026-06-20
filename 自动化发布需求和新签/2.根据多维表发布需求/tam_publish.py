@@ -119,25 +119,30 @@ def fill_and_publish(page: Page, record: dict, auto_yes: bool = False) -> bool:
 
         page.wait_for_timeout(1000)
 
-        # 16. 提示用户确认后发布
-        if not auto_yes:
-            print("\n  ====================================")
-            print("  请检查浏览器页面中的表单内容！")
-            print("  ====================================")
-            confirm = input("  确认发布？(Y/N): ").strip().upper()
-
-            if confirm != "Y":
-                print("  用户取消发布，跳过当前记录")
-                return False
-        else:
-            print("\n  [自动模式] 跳过确认，直接发布...")
-
-        # 点击"发布"按钮
+        # 16. 点击发布
         print("  正在点击发布按钮...")
         _click_publish(page)
 
-        # 等待提交结果
-        page.wait_for_timeout(5000)
+        # 17. 处理二次确认弹窗
+        print("  等待确认弹窗...")
+        page.wait_for_timeout(2000)
+        _confirm_dialog(page)
+
+        # 18. 等待提交结果并检查
+        page.wait_for_timeout(3000)
+
+        # 检查是否有表单校验错误
+        errors = page.locator('.ant-form-item-explain-error:visible, .ant-form-explain:visible').all()
+        if errors:
+            for e in errors:
+                try:
+                    print(f"  [ERROR] 表单校验失败: {e.text_content().strip()}")
+                except Exception:
+                    pass
+            print("  [WARN] 发布可能未成功，存在表单校验错误")
+            return False
+
+        page.wait_for_timeout(2000)
         print("  发布操作已执行")
         return True
 
@@ -163,67 +168,91 @@ def _ensure_radio_new(page: Page):
 
 def _select_application_code(page: Page, code: str):
     """
-    点击外包申请单编号的自定义选择组件 → 弹窗 → 输入编号 → 查询 → 选第1条 → 确定
+    点击外包申请单编号的选择组件 → 弹窗 → 输入编号 → 查询 → 选第1条 → 确定。
+    如果弹窗已打开（"继续创建"后），跳过打开步骤直接填写。
     """
     try:
-        # 点击自定义选择组件打开弹窗
-        custom_select = page.locator('.index_likeSelect__3RR5d')
-        if custom_select.count() > 0:
-            custom_select.first.click()
+        # 1. 打开申请单编号弹窗
+        modal = page.locator('.ant-modal-body:visible').first
+        if modal.count() == 0 or not modal.is_visible(timeout=500):
+            # 多种方式点击申请单编号字段打开弹窗
+            clicked = False
+            for sel in ['.index_likeSelect__3RR5d', '[class*=likeSelect]',
+                        'label[title*="外包申请单编号"] + * [class*=select]',
+                        'label[title*="外包申请单编号"]']:
+                el = page.locator(sel).first
+                if el.count() > 0 and el.is_visible(timeout=2000):
+                    el.click()
+                    page.wait_for_timeout(2000)
+                    clicked = True
+                    break
+            # JS 回退：通过标签找到输入区并点击
+            if not clicked:
+                clicked = page.evaluate("""() => {
+                    const labels = document.querySelectorAll('label');
+                    for (const l of labels) {
+                        if (l.textContent.includes('外包申请单编号')) {
+                            const formItem = l.closest('.ant-form-item');
+                            if (formItem) {
+                                const clickable = formItem.querySelector('[class*=likeSelect], [class*=select], input');
+                                if (clickable) { clickable.click(); return true; }
+                            }
+                        }
+                    }
+                    return false;
+                }""")
+                if clicked:
+                    page.wait_for_timeout(2000)
+        else:
+            print("    弹窗已打开，直接填写")
+
+        # 2. 在弹窗中填写申请单编号
+        modal = page.locator('.ant-modal-body:visible')
+        if modal.count() == 0:
+            print("    [WARN] 弹窗未出现")
+            return
+
+        code_input = modal.locator('label[title="外包申请单编号"]')
+        if code_input.count() > 0:
+            form_item = code_input.locator('xpath=ancestor::div[contains(@class,"ant-form-item")]')
+            inp = form_item.locator('input.ant-input').first
+            if inp.is_visible(timeout=3000):
+                inp.fill(code)
+                page.wait_for_timeout(500)
+        else:
+            inp = modal.locator('input.ant-input').first
+            if inp.is_visible(timeout=3000):
+                inp.fill(code)
+                page.wait_for_timeout(500)
+
+        # 3. 点击弹窗中的"查询"
+        query_btn = modal.locator('button:has-text("查询"), button:has-text("查 询")')
+        if query_btn.count() == 0:
+            print("    [WARN] 弹窗中未找到查询按钮")
+            return
+        query_btn.first.click()
+        page.wait_for_timeout(3000)
+
+        # 4. 选中第1条记录
+        table_row = modal.locator('.ant-table-row, .ant-table-tbody tr').first
+        if table_row.is_visible(timeout=5000):
+            row_radio = table_row.locator('input[type="radio"], input[type="checkbox"]').first
+            if row_radio.is_visible(timeout=2000):
+                row_radio.click(force=True)
+            else:
+                table_row.click()
+            page.wait_for_timeout(500)
+        else:
+            print("    [WARN] 弹窗中未找到查询结果行")
+
+        # 5. 点击"确定"
+        ok_btn = page.locator('.ant-modal button.ant-btn-background-ghost:has-text("确定")').first
+        if ok_btn.count() == 0:
+            ok_btn = page.locator('.ant-modal button:has-text("确定")').first
+        if ok_btn.count() > 0:
+            ok_btn.click()
             page.wait_for_timeout(2000)
 
-            # 在弹窗中找到"外包申请单编号"输入框（ant-modal 内的 ant-input）
-            modal = page.locator('.ant-modal-body:visible')
-            if modal.count() > 0:
-                # 找弹窗中的外包申请单编号输入框
-                code_input = modal.locator('label[title="外包申请单编号"]')
-                if code_input.count() > 0:
-                    # 找到同行的 input
-                    form_item = code_input.locator('xpath=ancestor::div[contains(@class,"ant-form-item")]')
-                    inp = form_item.locator('input.ant-input').first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill(code)
-                        page.wait_for_timeout(500)
-                else:
-                    # 尝试直接找弹窗中的第一个input
-                    inp = modal.locator('input.ant-input').first
-                    if inp.is_visible(timeout=3000):
-                        inp.fill(code)
-                        page.wait_for_timeout(500)
-
-                # 点击弹窗中的"查询"按钮
-                query_btn = modal.locator('button:has-text("查询"), button:has-text("查 询")')
-                if query_btn.count() > 0:
-                    query_btn.first.click()
-                    page.wait_for_timeout(3000)
-
-                    # 选中第1条记录（ant-table 行）
-                    table_row = modal.locator('.ant-table-row, .ant-table-tbody tr').first
-                    if table_row.is_visible(timeout=5000):
-                        # 点击行中的radio或checkbox，或直接点击行
-                        row_radio = table_row.locator('input[type="radio"], input[type="checkbox"]').first
-                        if row_radio.is_visible(timeout=2000):
-                            row_radio.click(force=True)
-                        else:
-                            table_row.click()
-                        page.wait_for_timeout(500)
-                    else:
-                        print("    [WARN] 弹窗中未找到查询结果行")
-
-                    # 点击"确定"按钮
-                    ok_btn = page.locator('.ant-modal button.ant-btn-background-ghost:has-text("确定")')
-                    if ok_btn.count() > 0:
-                        ok_btn.first.click()
-                        page.wait_for_timeout(2000)
-                    else:
-                        ok_btn2 = page.locator('.ant-modal button:has-text("确定")')
-                        if ok_btn2.count() > 0:
-                            ok_btn2.first.click()
-                            page.wait_for_timeout(2000)
-            else:
-                print("    [WARN] 弹窗未出现")
-        else:
-            print("    [WARN] 未找到外包申请单编号选择组件")
     except Exception as e:
         print(f"    [WARN] 选择外包申请单编号失败: {e}")
 
@@ -291,34 +320,33 @@ def _fill_form_input(page: Page, label_title: str, value: str):
 
 def _fill_form_select(page: Page, label_title: str, value: str):
     """
-    填写 ant-form-item 中的 ant-select 下拉框
-    点击下拉框 → 在搜索框输入文字 → 从下拉选项中匹配选择
+    填写 ant-form-item 中的 ant-select / TreeSelect 下拉框
     """
     form_item = _find_form_item(page, label_title)
     if not form_item:
         print(f"    [WARN] 未找到下拉框: {label_title}")
         return
 
-    # 点击 ant-select 打开下拉
     select = form_item.locator('.ant-select').first
     if not select.is_visible(timeout=3000):
         print(f"    [WARN] 下拉框不可见: {label_title}")
         return
 
     select.click()
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(800)
 
-    # 在搜索框中输入（ant-select 支持搜索）
-    search_input = form_item.locator('.ant-select-search__field, input.ant-select-search__field').first
-    if search_input.is_visible(timeout=1000):
-        search_input.fill(value)
-        page.wait_for_timeout(1000)
+    # 检测 TreeSelect
+    is_tree = page.locator('.ant-select-tree').first
+    if is_tree.count() > 0 and is_tree.is_visible(timeout=500):
+        # TreeSelect：搜索 → 展开 → 勾选（传入 form_item 限定范围）
+        _fill_tree_select(page, form_item, value)
     else:
-        # 非搜索型 select，直接尝试匹配选项
-        pass
-
-    # 从下拉选项中匹配选择
-    _select_ant_option(page, value)
+        # 普通 Select：搜索 → 点击选项
+        search_input = form_item.locator('.ant-select-search__field, input.ant-select-search__field').first
+        if search_input.is_visible(timeout=1000):
+            search_input.fill(value)
+            page.wait_for_timeout(1000)
+        _select_ant_option(page, value)
 
 
 def _fill_form_date(page: Page, label_title: str, date_str: str):
@@ -376,32 +404,76 @@ def _select_form_radio(page: Page, value: str):
 
 
 def _select_ant_option(page: Page, value: str):
-    """从 ant-select 下拉选项中匹配选择（模糊）"""
+    """从 ant-select 下拉选项中匹配选择"""
     try:
-        # 等待下拉菜单出现
         page.wait_for_timeout(500)
-        options = page.locator('.ant-select-dropdown:visible .ant-select-item-option, .ant-select-dropdown:visible li').all()
-        # 先精确匹配
+        options = page.locator('.ant-select-dropdown:visible .ant-select-item-option, .ant-select-dropdown:visible .ant-select-item, .ant-select-dropdown:visible li').all()
+        # Debug
+        texts = []
+        for o in options[:10]:
+            try:
+                texts.append(o.text_content().strip())
+            except Exception:
+                pass
+        print(f"    _select_ant_option: value='{value}', dropdown({len(options)}): {texts}")
+        # Match
         for opt in options:
             try:
                 text = opt.text_content().strip()
-                if text == value:
-                    opt.click()
-                    return
             except Exception:
                 continue
-        # 再模糊匹配
-        for opt in options:
-            try:
-                text = opt.text_content().strip()
-                if value in text or text in value:
-                    opt.click()
-                    return
-            except Exception:
-                continue
-    except Exception:
-        pass
+            if value == text or value in text or text in value:
+                opt.click(force=True)
+                page.wait_for_timeout(300)
+                print(f"    已点击: {text}")
+                return
+    except Exception as e:
+        print(f"    _select_ant_option 异常: {e}")
     print(f"    [WARN] 下拉选项未匹配: {value}")
+
+
+def _fill_tree_select(page: Page, form_item, value: str):
+    """Ant Design TreeSelect：在当前 form_item 内的搜索框输入 → 勾选 checkbox"""
+    # 在 form_item 范围内找搜索框（避免匹配到其他字段的搜索框）
+    search = form_item.locator('.ant-select-search__field').first
+    if search.count() > 0:
+        search.fill(value)
+        # 派发 input 事件触发 TreeSelect 过滤
+        search.evaluate("el => el.dispatchEvent(new Event('input', {bubbles: true}))")
+        page.wait_for_timeout(2000)
+        print(f"    TreeSelect 搜索: {value}")
+    else:
+        page.keyboard.type(value, delay=50)
+        page.wait_for_timeout(1500)
+
+    # JS 精确匹配每个 .ant-select-tree-title 的自身文本（不包含子节点）
+    # 关键：title.textContent 是节点自身文本，"山东省"不含"济南"，"济南市"才含"济南"
+    result = page.evaluate(f"""() => {{
+        const titles = document.querySelectorAll('.ant-select-tree-title');
+        for (const t of titles) {{
+            if (t.offsetParent === null) continue;
+            const titleText = t.textContent.trim();
+            const searchText = '{value}';
+            const shortText = '{value.rstrip("市区县")}';
+            if (titleText.includes(searchText) || titleText.includes(shortText) || searchText.includes(titleText)) {{
+                const li = t.closest('li');
+                if (!li) continue;
+                const cb = li.querySelector('.ant-select-tree-checkbox');
+                if (cb) {{
+                    cb.click();
+                    return titleText;
+                }}
+            }}
+        }}
+        return null;
+    }}""")
+    if result:
+        page.wait_for_timeout(300)
+        print(f"    勾选: {result}")
+    else:
+        print(f"    [WARN] TreeSelect 未匹配: {value}")
+
+    print(f"    [WARN] TreeSelect 未匹配: {value}")
 
 
 def _select_supplier(page: Page, supplier: str):
@@ -520,3 +592,57 @@ def _click_publish(page: Page):
         }""")
     except Exception as e:
         print(f"    [WARN] 点击发布按钮失败: {e}")
+
+
+def _confirm_dialog(page: Page):
+    """点击发布后的二次确认弹窗，点击"确定"按钮（可能是"确 定"带空格）"""
+    # 用 JS 匹配：找弹窗中 primary 按钮，文本去空格后是"确定"
+    clicked = page.evaluate("""() => {
+        const modals = document.querySelectorAll('.ant-modal-confirm, .ant-modal');
+        for (const modal of modals) {
+            if (modal.offsetParent === null) continue;
+            const btns = modal.querySelectorAll('button.ant-btn-primary');
+            for (const b of btns) {
+                if (b.offsetParent === null) continue;
+                if (b.textContent.replace(/\\s/g, '') === '确定') {
+                    b.click(); return 'modal';
+                }
+            }
+        }
+        // 回退：全局找 primary 按钮
+        const all = document.querySelectorAll('button.ant-btn-primary');
+        for (const b of all) {
+            if (b.offsetParent === null) continue;
+            if (b.textContent.replace(/\\s/g, '') === '确定') {
+                b.click(); return 'global';
+            }
+        }
+        return null;
+    }""")
+    if clicked:
+        page.wait_for_timeout(2000)
+        print(f"  已点击确认弹窗'确定' ({clicked})")
+    else:
+        print("  [INFO] 未检测到确认弹窗，可能无需二次确认")
+
+
+def _click_continue_create(page: Page):
+    """点击发布成功弹窗中的"继续创建"按钮，直接进入下一条的申请单查询弹窗"""
+    print("  查找'继续创建'按钮...")
+    clicked = page.evaluate("""() => {
+        const all = document.querySelectorAll('button, a, span[role=button]');
+        for (const el of all) {
+            if (el.offsetParent === null) continue;
+            const t = el.textContent.replace(/\\s/g, '');
+            if (t.includes('继续创建') || t.includes('继续发布') || t.includes('再创建')) {
+                el.click();
+                return t;
+            }
+        }
+        return null;
+    }""")
+    if clicked:
+        print(f"  已点击'{clicked}'，等待申请单弹窗...")
+        page.wait_for_timeout(2000)
+    else:
+        print("  [WARN] 未找到'继续创建'按钮，请手动点击")

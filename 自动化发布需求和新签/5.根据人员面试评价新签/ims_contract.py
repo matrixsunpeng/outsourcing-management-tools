@@ -126,33 +126,15 @@ def process_contract_group(page: Page, group: dict, auto_yes: bool = False,
         if not _calculate_cost(frame):
             print(f"  [WARN] 成本计算可能未完成，继续提交...")
 
-        # Step 5: 提交确认
-        print(f"  [5] 提交确认...")
-        if auto_yes:
-            print("  [自动模式] 自动确认提交")
-            confirmed = True
-        else:
-            try:
-                confirm = input("\n  是否提交？(Y/N): ").strip().upper()
-                confirmed = (confirm == "Y")
-            except EOFError:
-                print("  [WARN] 无交互输入，默认跳过提交")
-                confirmed = False
-
-        if not confirmed:
-            print("  用户跳过提交")
-            result["status"] = "SKIPPED"
-            result["reason"] = "用户跳过"
-            return result
-
-        # Step 6: 保存并提交审批
+        # Step 5: 保存并提交审批（自动提交，不询问）
+        print(f"  [5] 保存并提交审批...")
         success, msg = _submit_contract(page, frame)
 
         if success:
             print(f"  签署成功!")
             result["status"] = "SUCCESS"
             if bitable_token and table_id:
-                update_records_signed(bitable_token, table_id, record_ids, order_no=msg)
+                update_records_signed(bitable_token, table_id, record_ids)
         else:
             print(f"  签署失败: {msg}")
             result["status"] = "FAILED"
@@ -837,7 +819,11 @@ def _calculate_cost(frame: Frame) -> bool:
 # ==================== 提交 ====================
 
 def _submit_contract(page: Page, frame: Frame) -> tuple[bool, str]:
-    """点击"保存并提交审批"，获取弹窗文字判断成功/失败，捕获订单编号"""
+    """点击"保存并提交审批"，处理弹窗，判断成功/失败，捕获订单编号。
+
+    成功路径: 保存→"是否确认保存并提交订单?"→确认→无新弹窗→有订单编号
+    失败路径: 弹窗内容≠确认弹窗 / 确认后又出新弹窗 → 捕获文本作为失败原因
+    """
     try:
         # 先滚到底部
         frame.evaluate("window.scrollTo(0, document.body.scrollHeight)")
@@ -850,67 +836,128 @@ def _submit_contract(page: Page, frame: Frame) -> tuple[bool, str]:
             print("  已点保存并提交审批")
         else:
             frame.evaluate("if(typeof saveAndSubmit==='function')saveAndSubmit()")
-        # 等弹窗出现 → 点确定 → 检测错误
-        page.wait_for_timeout(2000)
-        _click_ok_in_dialog(page)
-        page.wait_for_timeout(3000)
 
-        # 检测提交结果
-        error = _detect_error(page)
-        if error:
-            print(f"  提交失败: {error[:80]}")
+        # ── 等待弹窗出现 ──
+        page.wait_for_timeout(2500)
+        dialog_text = _get_visible_dialog_text(page)
+
+        # ── 判断弹窗类型 ──
+        if "是否确认保存并提交订单" in dialog_text or "是否确认" in dialog_text:
+            # 正确的确认弹窗 → 点"确认"
+            print(f"  检测到确认弹窗: {dialog_text[:60]}...")
             _click_ok_in_dialog(page)
-            page.wait_for_timeout(1000)
-            return False, error[:200]
+            page.wait_for_timeout(3500)
 
-        # 获取技术合作订单编号
-        order_no = ""
-        try:
-            order_no = frame.evaluate("""(function(){
-                var el=document.getElementById('techCoopNumbers');
-                if(el&&el.value) return el.value;
-                try{var c=mini.get('techCoopNumbers');if(c&&c.getValue) return c.getValue()||'';}catch(e){}
-                return '';
-            })()""")
-        except: pass
-        if order_no:
-            print(f"  订单编号: {order_no}")
+            # 确认后检查是否有新弹窗（= 失败）
+            post_text = _get_visible_dialog_text(page)
+            if post_text and "是否确认" not in post_text:
+                print(f"  提交失败，错误弹窗: {post_text[:100]}")
+                _click_ok_in_dialog(page)
+                page.wait_for_timeout(500)
+                return False, post_text[:500]
 
-        return True, order_no
+        elif dialog_text:
+            # 不是确认弹窗 → 直接失败
+            print(f"  提交失败，异常弹窗: {dialog_text[:100]}")
+            _click_ok_in_dialog(page)
+            page.wait_for_timeout(500)
+            return False, dialog_text[:500]
+
+        else:
+            # 没有弹窗 — 可能直接成功了，也可能按钮没反应
+            print("  未检测到弹窗")
+            page.wait_for_timeout(2000)
+
+        # 走到这里说明没有失败弹窗 → 成功
+        print("  提交成功!")
+        return True, ""
 
     except Exception as e:
         return False, str(e)
 
 
+def _get_visible_dialog_text(page: Page) -> str:
+    """获取页面上当前可见的 MiniUI 弹窗/对话框的文本内容。
+
+    遍历所有 frame（iframe 中的弹窗也能搜到），
+    用 getComputedStyle 而非 offsetParent 判断可见性
+    （MiniUI 弹窗常用 position:fixed，会导致 offsetParent===null 被误判为隐藏）。
+    """
+    _is_visible_js = """
+        (function(el) {
+            var style = window.getComputedStyle(el);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            var rect = el.getBoundingClientRect();
+            return rect.width > 1 && rect.height > 1;
+        })
+    """
+    _extract_js = """
+    (function() {
+        var isVisible = """ + _is_visible_js + """;
+        var containers = document.querySelectorAll(
+            '.mini-window, .mini-messagebox, .mini-modal, .mini-alert'
+        );
+        for (var i = 0; i < containers.length; i++) {
+            var d = containers[i];
+            if (!isVisible(d)) continue;
+            // 先取弹窗 body/content（排除标题栏/按钮栏）
+            var body = d.querySelector('.mini-panel-body, .mini-messagebox-content');
+            if (body) {
+                var t = (body.innerText || body.textContent || '').trim();
+                if (t && t.length > 1) return t;
+            }
+            // 回退：整个弹窗文本
+            var t = (d.innerText || d.textContent || '').trim();
+            if (t && t.length > 1) return t;
+        }
+        return '';
+    })()
+    """
+    # 搜索主页面 + 所有 iframe
+    for ctx in [page] + list(page.frames):
+        try:
+            text = ctx.evaluate(_extract_js)
+            if text:
+                return text
+        except Exception:
+            continue
+    return ""
+
+
 def _click_ok_in_dialog(page: Page):
-    """在弹窗/对话框中点击确定（广泛搜索所有可能的确定按钮）"""
+    """在弹窗/对话框中点击确定/确认（覆盖"保存并提交审批"后的确认弹窗）"""
     try:
         for i in range(10):
-            # 搜索所有frame中所有可能的"确定"元素
+            # 搜索所有frame中所有可能的"确定"/"确认"元素
             for ctx in [page] + list(page.frames):
-                for sel in ['a:has-text("确定")', 'button:has-text("确定")',
-                            'span:has-text("确定")', '.mini-button:has-text("确定")',
-                            '.mini-messagebox-button', 'a.g_a:has-text("确定")',
-                            '[onclick*="submit"]', '[onclick*="ok"]',
-                            '.mini-window .mini-button:has-text("确定")']:
+                for sel in [
+                    'a:has-text("确认")', 'button:has-text("确认")',
+                    'span:has-text("确认")', '.mini-button:has-text("确认")',
+                    'a:has-text("确定")', 'button:has-text("确定")',
+                    'span:has-text("确定")', '.mini-button:has-text("确定")',
+                    '.mini-messagebox-button', 'a.g_a:has-text("确定")',
+                    '[onclick*="submit"]', '[onclick*="ok"]',
+                    '.mini-window .mini-button:has-text("确认")',
+                    '.mini-window .mini-button:has-text("确定")',
+                ]:
                     try:
                         btn = ctx.locator(sel).first
                         if btn.count() > 0 and btn.is_visible(timeout=1000):
                             btn.click(force=True, timeout=2000)
-                            print("  已点击确定")
+                            print(f"  已点击: {sel}")
                             return
                     except: pass
             page.wait_for_timeout(500)
-        # 最后尝试：JS点击所有可见的确定/OK按钮
+        # 最后尝试：JS点击所有可见的确认/确定/OK按钮
         page.evaluate("""
             document.querySelectorAll('a,button,span,input').forEach(function(el){
                 var t=(el.innerText||el.value||'').trim();
-                if((t==='确定'||t==='OK'||t==='确认') && el.offsetParent!==null) el.click();
+                if((t==='确认'||t==='确定'||t==='OK') && el.offsetParent!==null) el.click();
             });
         """)
-        print("  已尝试JS点击确定")
+        print("  已尝试JS点击确认/确定")
     except Exception as e:
-        print(f"  [WARN] 点击确定失败: {e}")
+        print(f"  [WARN] 点击确认按钮失败: {e}")
 
 
 def _detect_error(page: Page) -> str | None:

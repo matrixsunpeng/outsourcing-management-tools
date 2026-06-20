@@ -11,7 +11,7 @@ def create_browser_context(playwright: sync_playwright, data_dir: str) -> tuple[
     启动浏览器并配置下载路径
     返回 (browser, context, page)
     """
-    browser = playwright.chromium.launch(headless=False)
+    browser = playwright.chromium.launch(headless=False, channel="chrome")
     context = browser.new_context(accept_downloads=True)
     page = context.new_page()
     return browser, context, page
@@ -23,7 +23,7 @@ def login_tam(page: Page, username: str, password: str) -> Page:
     返回登录后的 page 对象
     """
     print("  正在访问 TAM 网站...")
-    page.goto("https://tam.asiainfo.com/webapps/ai-hr-tam-web/", wait_until="networkidle", timeout=60000)
+    page.goto("https://tam.asiainfo.com/webapps/ai-hr-tam-web/", wait_until="domcontentloaded", timeout=30000)
     page.wait_for_timeout(3000)
 
     # 检查是否已经在登录页面或已经登录
@@ -100,46 +100,82 @@ def login_tam(page: Page, username: str, password: str) -> Page:
     return page
 
 
-def navigate_to_new_recruitment_task(page: Page) -> Page:
+def navigate_to_new_recruitment_task(page: Page, reset: bool = False) -> Page:
     """
     导航到 新建招聘任务 页面
-    路径: 人才招聘 > 招聘任务 > 新建招聘任务
+    reset=True 时用 JS 直接操作侧边栏菜单（不依赖 Playwright 可见性检查）
     """
-    print("  正在导航到新建招聘任务页面...")
+    if reset:
+        print("  重置并导航到新建招聘任务页面(JS)...")
+        # 1. 先回 TAM 首页
+        try:
+            page.goto("https://tam.asiainfo.com/webapps/ai-hr-tam-web/", wait_until="domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        try:
+            page.wait_for_load_state("networkidle", timeout=10000)
+        except Exception:
+            pass
+        page.wait_for_timeout(3000)
 
-    # 先尝试关闭可能的弹窗
+        # 2. JS 直接点击侧边栏菜单项（绕过 Playwright 可见性/遮挡检查）
+        _click_menu_by_js(page)
+        page.wait_for_timeout(2000)
+        print("  导航完成(JS)")
+        return page
+
+    # 非 reset：使用 Playwright 正常点击（首次导航）
+    print("  正在导航到新建招聘任务页面...")
     _dismiss_modals(page)
 
-    # 点击左侧功能栏 "人才招聘"
     try:
         recruit_menu = page.locator('text=人才招聘').first
         if recruit_menu.is_visible(timeout=5000):
             recruit_menu.click()
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
             print("  已点击 '人才招聘'")
-        else:
-            print("  [WARN] 未找到 '人才招聘' 菜单")
-    except Exception as e:
-        print(f"  [WARN] 点击 '人才招聘' 失败: {e}")
+    except Exception:
+        pass
 
-    # 点击 "招聘任务"
     try:
         task_menu = page.locator('text=招聘任务').first
         if task_menu.is_visible(timeout=5000):
             task_menu.click()
-            page.wait_for_timeout(1000)
+            page.wait_for_timeout(1500)
             print("  已点击 '招聘任务'")
-        else:
-            print("  [WARN] 未找到 '招聘任务' 菜单")
-    except Exception as e:
-        print(f"  [WARN] 点击 '招聘任务' 失败: {e}")
+    except Exception:
+        pass
 
-    # 点击 "新建招聘任务"（尝试多种方式）
     _click_new_recruitment_task(page)
 
-    page.wait_for_load_state("networkidle", timeout=15000)
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        pass
+    page.wait_for_timeout(1000)
     print("  导航完成")
     return page
+
+
+def _click_menu_by_js(page: Page):
+    """用 JS 直接点击侧边栏菜单：人才招聘 → 招聘任务 → 新建招聘任务"""
+    for step, text in enumerate(["人才招聘", "招聘任务", "新建招聘任务"]):
+        clicked = page.evaluate(f"""() => {{
+            const items = document.querySelectorAll('.ant-menu-item, .ant-menu-submenu-title, '
+                + 'a, span, li, div[class*=menu]');
+            for (const el of items) {{
+                if (el.offsetParent !== null && el.textContent.trim() === '{text}') {{
+                    el.click();
+                    return true;
+                }}
+            }}
+            return false;
+        }}""")
+        if clicked:
+            print(f"  JS已点击 '{text}'")
+            page.wait_for_timeout(1500)
+        else:
+            print(f"  [WARN] JS未找到 '{text}'")
 
 
 def _click_new_recruitment_task(page: Page):

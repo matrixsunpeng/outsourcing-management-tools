@@ -103,13 +103,15 @@ def main():
         # Mode 2: process existing file
         process_and_upload(args.file)
     elif args.auto:
-        # Mode 1: full automation
+        # Mode 1: full automation (may return multiple files for multi-BU)
         try:
             from web_automation import IMSAutomator
             automator = IMSAutomator()
-            filepath = automator.run()
-            if filepath:
-                process_and_upload(filepath)
+            filepaths = automator.run()
+            if filepaths:
+                for fp in filepaths:
+                    print(f"\n[处理] 处理文件: {fp}")
+                    process_and_upload(fp)
         except Exception as e:
             print(f"IMS 自动化失败: {e}")
             print("可以手动导出文件后用 --file 参数重试。")

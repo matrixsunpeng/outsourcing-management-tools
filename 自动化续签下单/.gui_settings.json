@@ -1,0 +1,13 @@
+{
+  "mode": 3,
+  "username": "sunpeng5",
+  "start_date": "2026年3月31日",
+  "end_date": "2026年3月31日",
+  "audit_date": "",
+  "sbu": "CMB",
+  "skip_delete": false,
+  "resume": true,
+  "todo_file": "F:\\ClaudeCode\\外包工具箱\\自动化续签下单\\待办订单清单_20260610_233802.xlsx",
+  "nr_file": "F:\\ClaudeCode\\外包工具箱\\自动化续签下单\\离岗不续签清单_20260610_233856.xlsx",
+  "headless": false
+}

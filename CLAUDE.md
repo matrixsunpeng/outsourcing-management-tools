@@ -4,13 +4,26 @@ This file provides guidance to Claude Code when working with code in this reposi
 
 ## 项目概述
 
-`外包工具箱` 是一套 IMS 企业系统网页自动化工具集，共 13 个模块，分为三类：
+`外包工具箱` 是一套 IMS 企业系统网页自动化工具集，共 14 个模块，分为四类：
 
 1. **报表下载类**（9 个）：自动登录 IMS → 导航到特定页面 → 选择条件 → 查询 → 导出 Excel
 2. **数据修改类**（1 个）：在 IMS 页面批量修改资源池预算数据
 3. **流程编排类**（3 个）：多步骤流水线（下载→解析→下单→回写），通过飞书多维表串联
+4. **数据抓取类**（1 个）：从外部 React SPA 逐条抓取数据并回写 Excel
 
 目标系统: `https://ims.asiainfo.com/AIOMS/Jsp/main.jsp`，左侧 MiniUI 树形菜单导航。
+
+## 共享工具包 `common/`
+
+项目根目录下的 `common/` 包提供了所有模块的公共基础设施：
+
+| 文件 | 说明 |
+|------|------|
+| `common/__init__.py` | 空包标记 |
+| `common/base_downloader.py` | **`BaseDownloader` 基类**（~600行），所有 IMS 下载模块的公共抽象。提供：浏览器生命周期管理（start/stop）、统一登录流程、菜单导航（展开父菜单 + 单击子菜单，支持新标签页/iframe 双模式）、MiniUI 控件操作（combobox 单选/多选、日期输入、弹窗关闭）、Layui 控件操作（select、日期输入）、查询与导出下载 |
+| `common/utils.py` | 日期/时间解析工具函数：`parse_date_input()`、`to_iso_date()`、`parse_time_input()`、`parse_period_input()`、`parse_quarter_input()`、`now_timestamp()` |
+
+下载类模块继承 `BaseDownloader`，子类只需覆盖 `MENU_PARENT`、`MENU_CHILD`、`FRAME_KEYWORDS` 等类常量，并实现 `query_and_export()` 方法。非下载类模块（如流程编排类）则独立实现，不依赖基类。
 
 ## 模块清单
 
@@ -18,17 +31,20 @@ This file provides guidance to Claude Code when working with code in this reposi
 |------|-------------|--------|
 | 下载人员变化报表 | MiniUI | 新标签页打开，SBU+人员状态+工作时间三条件 |
 | 下载人员变更 | MiniUI | 单据状态多选（UI交互方式），含死代码已清理 |
-| 下载人员面试评价表 | **Layui** | 非MiniUI，普通HTML select+Layui日期控件 |
+| 下载人员面试评价表（不分审批状态） | **Layui** | 非MiniUI，普通HTML select+Layui日期控件 |
 | 下载外包合同 | MiniUI | 导出按钮为"导出合同"，技术合作种类按索引选择 |
 | 下载外包续签查询 | MiniUI | 导出按钮为"导出待续签人员"，含表单清空逻辑 |
 | 下载工时 | MiniUI | Combobox滚动查找选项 |
 | 下载绩效考核 | **Layui** | 两级菜单展开，季度×BU双重循环，支持代码/名称匹配 |
-| 下载节假日加班 | **Layui** | 日期输入需手动移除`.layui-laydate`弹出层 |
+| 下载节假日加班（不分审批状态） | **Layui** | 日期输入需手动移除`.layui-laydate`弹出层 |
 | 下载计提和结算 | MiniUI | 通过标签文本定位关联combobox，月份范围直接输入 |
-| 外包预算滚动预测 | - | Excel数据处理+HTML仪表盘生成，含JS续签预测计算 |
+| 外包预算滚动预测 | — | Excel数据处理+HTML仪表盘生成，含JS续签预测计算。内含 `contract/` 和 `settlement/` 两个下载子模块 |
 | 自动化修改资源池预算 | **Layui**（表格）+ layer弹窗 | JS dispatchEvent绕过遮挡，编辑弹窗是iframe |
-| 自动化续签下单 | MiniUI | 最复杂模块：下载→解析→逐条下单→状态回写 |
-| 自动发布需求 | MiniUI+Layui | 5个子项目流水线，含飞书多维表+lark-cli |
+| 自动化续签下单 | MiniUI | 最复杂模块之一：下载→解析→逐条下单→状态回写。含 `gui_app.py` tkinter图形界面、`utils/` Excel解析工具包、3个内嵌下载子模块 |
+| 自动化发布需求和新签 | MiniUI+Layui+TAM | **5个子项目流水线**，含飞书多维表+lark-cli+飞书REST API。Phase1-3用lark-cli，Phase4-5用REST API。有独立`CLAUDE.md` |
+| 抓取实习生转外包手机号 | React(SPA) | 非IMS系统，work.asiainfo.com联系人搜索，逐条查询回写Excel |
+
+**注意**：`自动化续签下单` 和 `自动化发布需求和新签` 两个模块各自内嵌了所需下载器的拷贝（如人员变更下载器、续签查询下载器、申请单下载器等），这些内嵌拷贝独立于顶层同名模块，需单独维护。
 
 ## 核心架构模式
 
@@ -37,23 +53,20 @@ This file provides guidance to Claude Code when working with code in this reposi
 每个下载模块几乎完全遵循相同的类结构。新增模块时可从任一模块复制骨架：
 
 ```python
-class XxxDownloader:
-    LOGIN_URL = "https://ims.asiainfo.com/AIOMS/Jsp/main.jsp"
-    SELECTORS = { ... }        # CSS选择器字典
-    MINIUI_IDS = { ... }       # MiniUI控件ID映射（Layui页面用LAYUI_IDS）
+class XxxDownloader(BaseDownloader):
+    MENU_PARENT = "父菜单名"        # 左侧一级菜单文本
+    MENU_CHILD = "子菜单名"          # 左侧二级菜单文本
+    FRAME_KEYWORDS = ["keyword1", "keyword2"]  # iframe URL 关键词匹配
 
-    def __init__(self, username, password, download_dir, headless):  # 初始化路径和状态
-    def start(self):           # 启动Playwright浏览器
-    def stop(self):            # 关闭浏览器
-    def __enter__/__exit__:    # 上下文管理器
-    def login(self):           # 统一登录流程
-    def navigate_to_xxx(self): # 左侧树菜单导航（新标签页/iframe双模式）
-    def _find_target_frame(self):  # iframe关键词匹配
-    def _get_fresh_frame(self):    # 重新获取frame（防detach）
-    def _query_and_export(self):   # 条件填写→查询→导出
-    def download_xxx_reports(self):  # 主入口：批量循环
-    def main():                # argparse + 交互式输入
+    def __init__(self, username, password, download_dir, headless):
+        super().__init__(username, password, download_dir, headless)
+
+    def query_and_export(self, **kwargs):
+        # 子类只需实现此方法：填写查询条件 → 点击查询 → 导出
+        pass
 ```
+
+`BaseDownloader` 自动处理：浏览器生命周期、登录、菜单导航、iframe/标签页管理。子类通过 `self.page`（主页面）和 `self.target`（目标页面/iframe）访问 Playwright 对象。
 
 ### 2. 左侧树形菜单导航（核心模式）
 
@@ -209,6 +222,23 @@ MERGE_SCRIPT = os.path.join(BASE_DIR, "merge_data.py")
 DOWNLOAD_SCRIPT = os.path.join(BASE_DIR, "settlement", "settlement_downloader.py")
 ```
 
+## 日期格式约定
+
+项目中使用两种日期格式：
+- **用户输入**：`YYYY年MM月DD日`（如 `2026年1月1日`）
+- **系统设置**：`YYYY-MM-DD`（如 `2026-01-01`，MiniUI/Layui 控件要求）
+- 各模块的 `parse_date_input()` 函数负责转换
+
+## 依赖
+
+核心依赖：`playwright`、`pandas`、`openpyxl`
+可选依赖：`python-dotenv`（自动化发布需求和新签模块）、`xlrd`（读取老 .xls 文件）、`requests`（飞书 REST API）、`tkinter`（GUI 模块）
+
+首次使用需安装 Playwright 浏览器：
+```bash
+playwright install chromium
+```
+
 ## 常见踩坑
 
 ### 1. 表单条件串扰
@@ -252,26 +282,80 @@ IMS 登录页的实际按钮可能不是 `<button type="submit">` 或 `<input ty
 - 在 `_query_and_export` 开头执行 `location.reload()` 强制刷新页面
 - 对 buttonedit 类型控件按文本选择失败时，回退到 MiniUI API `combo.setValue()`
 
-## 日期格式约定
+### 11. work.asiainfo.com 遮罩层拦截按钮点击
 
-项目中使用两种日期格式：
-- **用户输入**：`YYYY年MM月DD日`（如 `2026年1月1日`）
-- **系统设置**：`YYYY-MM-DD`（如 `2026-01-01`，MiniUI/Layui 控件要求）
-- 各模块的 `parse_date_input()` 函数负责转换
+联系页面的 `<div class="kf-top">` 固定顶栏内含 `<div class="container">`，覆盖在"查询"按钮上方。Playwright 的 `.click()` 会检测到 pointer events 被拦截并自动重试 22 次（每次 500ms），最终超时报 `TargetClosedError`。
 
-## 依赖
+解决：
+- **搜索表单优先用 Enter 键提交**：`fill()` 后输入框已获得焦点，直接 `page.keyboard.press("Enter")` 提交，完全绕过遮罩
+- **必须点击按钮时用 JS 派发**：`btn.evaluate("el => el.click()")` 绕过 Playwright actionability 检查
 
-核心依赖：`playwright`、`pandas`、`openpyxl`
-可选依赖：`python-dotenv`（自动发布需求模块）、`xlrd`（读取老 .xls 文件）
+```python
+# 正确做法
+search_input.fill(keyword)
+page.keyboard.press("Enter")  # 优先，绕过所有 overlay
 
-首次使用需安装 Playwright 浏览器：
-```bash
-playwright install chromium
+# 备选
+btn.evaluate("el => el.click()")  # JS 直接派发，不做可见性检查
 ```
+
+### 12. `locator("body")` 解析到多个元素
+
+work.asiainfo.com 是 React SPA（`#app`），页面可能存在两个 `<body>` 元素（主文档 + `#app` 内嵌）。`page.locator("body").inner_text()` 会触发 Playwright strict mode violation。
+
+解决：用 `.all()` 遍历所有 body 元素，拼接文本：
+
+```python
+page_text = ""
+for body in page.locator("body").all():
+    try:
+        page_text += body.inner_text() + "\n"
+    except Exception:
+        continue
+```
+
+### 13. SPA 搜索页面状态不可预设
+
+work.asiainfo.com 联系人页是 React SPA，搜索后页面 DOM 发生变化（进入详情卡片视图），下次搜索前必须重新导航回搜索页。不能假设页面停留在可搜索状态。
+
+解决：**每条查询前** 都执行 `page.goto(CONTACT_URL)` 回到搜索页，确保搜素输入框和按钮在 DOM 中。
+
+```python
+def search_contact(self, nt_account):
+    self._page.goto(self.CONTACT_URL, wait_until="networkidle")
+    self._page.wait_for_timeout(3000)
+    # 然后再定位输入框、填写、提交
+```
+
+### 14. 页面字段名与 spec 文档不一致
+
+spec.docx 描述联系人的手机字段标签为"手机/座机"，但实际页面渲染的是"手机/电话"。正则提取必须同时兼容两种格式。
+
+解决：用 `(?:座机|电话)` 非捕获组匹配两种变体：
+
+```python
+patterns = [
+    r'手机[/\s]*(?:座机|电话)[：:]\s*(\d{11})',  # 兼容 "手机/座机" 和 "手机/电话"
+    r'手机[：:]\s*(\d{11})',                      # "手机：xxx"
+    r'(?:座机|电话)[：:]\s*(\d{11})',             # "电话：xxx" 或 "座机：xxx"
+]
+```
+
+### 15. IMS 版本更新导致页面结构变化
+
+"下载人员面试评价表"页面 IMS 更新后，Layui select 选项 value 从"已通过/未通过"变为数字（如"1/3"），导致基于文本匹配的选项定位失效。
+
+解决：先用文本匹配尝试，失败后回退到按索引选择；必要时打开浏览器 visible 模式手动确认选项映射关系。
+
+### 16. 密码中含特殊字符的 Shell 注入风险
+
+部分模块通过 `subprocess` 调用外部命令时拼接密码参数。如果密码含 `$`、`` ` ``、`\` 等 shell 特殊字符，可能被解释执行。
+
+解决：使用 `subprocess.run([...], shell=False)` 传递参数列表而非字符串；或用 `shlex.quote()` 转义。
 
 ## 安全注意事项
 
 - **永远不要**在 config.py 中硬编码真实凭据，保持空字符串
 - config.py 中的凭据通过命令行参数或交互式输入获取
-- `.env` 文件应加入 `.gitignore`
+- `.env` 文件应加入 `.gitignore`（项目 `.gitignore` 已配置，`config.env` 和 `config.env.example` 除外）
 - 日志文件中可能包含敏感业务数据，注意清理

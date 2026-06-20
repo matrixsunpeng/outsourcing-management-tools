@@ -18,34 +18,73 @@ from dotenv import dotenv_values
 # 禁用输出缓冲
 sys.stdout.reconfigure(line_buffering=True)
 
+
+def secure_input(prompt="密码: "):
+    """密码输入 — Windows 显示 * 回显，其他平台用 getpass"""
+    if sys.platform == "win32":
+        import msvcrt
+        print(prompt, end="", flush=True)
+        password = ""
+        while True:
+            ch = msvcrt.getch()
+            if ch in (b"\r", b"\n"):
+                print()
+                break
+            elif ch == b"\x08":
+                if password:
+                    password = password[:-1]
+                    print("\b \b", end="", flush=True)
+            elif ch == b"\x03":
+                raise KeyboardInterrupt()
+            else:
+                password += ch.decode("utf-8", errors="ignore")
+                print("*", end="", flush=True)
+        return password
+    else:
+        import getpass
+        return getpass.getpass(prompt)
+
+
 from playwright.sync_api import sync_playwright
 
 from tam_login import create_browser_context, login_tam, navigate_to_new_recruitment_task
-from tam_publish import fill_and_publish
+from tam_publish import fill_and_publish, _click_continue_create
 from feishu_query import query_unpublished_records, get_bitable_config
 from feishu_update import update_record_published
 
 
 def main():
     # 解析命令行参数
-    auto_yes = "-y" in sys.argv or "--yes" in sys.argv
+    import argparse
+    parser = argparse.ArgumentParser(description="根据多维表发布需求")
+    parser.add_argument("-y", "--yes", action="store_true", help="自动确认发布（跳过交互）")
+    parser.add_argument("--username", default="", help="IMS 登录用户名")
+    parser.add_argument("--password", default="", help="IMS 登录密码")
+    args, unknown = parser.parse_known_args()
+
+    auto_yes = args.yes
+
+    # 加载配置（用于多维表 token 和凭证回退）
+    config_path = os.path.join(os.path.dirname(__file__), "config.env")
+    config = dotenv_values(config_path)
+
+    username = args.username or config.get("IMS_USERNAME", "")
+    password = args.password or config.get("IMS_PASSWORD", "")
+
+    if not username:
+        username = input("IMS 用户名: ").strip()
+    if not password:
+        password = secure_input("IMS 密码: ").strip()
+
+    if not username or not password:
+        print("[ERROR] 用户名和密码不能为空")
+        sys.exit(1)
 
     print("=" * 60)
     print(f"根据多维表发布需求 - 开始运行 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     if auto_yes:
         print("模式: 自动确认发布")
     print("=" * 60)
-
-    # 加载配置
-    config_path = os.path.join(os.path.dirname(__file__), "config.env")
-    config = dotenv_values(config_path)
-
-    username = config.get("IMS_USERNAME", "")
-    password = config.get("IMS_PASSWORD", "")
-
-    if not username or not password:
-        print("[ERROR] 请先在 config.env 中填写 IMS_USERNAME 和 IMS_PASSWORD")
-        sys.exit(1)
 
     # Step 1: 查询多维表未发布记录
     print("\n[Step 1] 查询飞书多维表未发布记录")
@@ -92,10 +131,14 @@ def main():
                 print("-" * 40)
 
                 try:
-                    # 每次重新导航到新建招聘任务页面
-                    if idx > 0:
-                        print("  重新导航到新建招聘任务页面...")
+                    # 第一条记录：导航到新建招聘任务页面
+                    # 后续记录：发布成功后通过"继续创建"按钮进入下一条
+                    if idx == 0:
                         page = navigate_to_new_recruitment_task(page)
+                    else:
+                        # 点击上一条发布成功弹窗中的"继续创建"
+                        _click_continue_create(page)
+                        page.wait_for_timeout(2000)
 
                     # 填写表单并发布
                     published = fill_and_publish(page, record, auto_yes=auto_yes)

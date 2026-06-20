@@ -53,7 +53,7 @@ def update_record_published(bitable_token: str, table_id: str, record_id: str):
 
     try:
         result = _run_lark_cli([
-            "base", "+record-update",
+            "base", "+record-upsert",
             "--base-token", bitable_token,
             "--table-id", table_id,
             "--record-id", record_id,

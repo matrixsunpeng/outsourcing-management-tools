@@ -26,7 +26,7 @@ def login_ims(page: Page, username: str, password: str) -> Page:
     返回登录后的 page 对象
     """
     print("  正在访问 IMS 网站...")
-    page.goto(IMS_URL, wait_until="networkidle", timeout=30000)
+    page.goto(IMS_URL, wait_until="load", timeout=15000)
 
     # IMS 会重定向到 sso.asiainfo.com 进行认证
     if "sso.asiainfo.com" in page.url:

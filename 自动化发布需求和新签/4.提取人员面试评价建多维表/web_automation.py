@@ -2,9 +2,13 @@
 
 Login → Navigate → Query → Export → Download.
 The IMS system uses a frameset — left tree menu + right content area.
+
+Supports multiple BU codes: logs in once, then loops per BU,
+returning a list of downloaded file paths.
 """
 
 import os
+import re
 import time
 from datetime import date, timedelta
 
@@ -13,14 +17,48 @@ from playwright.sync_api import sync_playwright, Page, Browser, Frame, BrowserCo
 from config import Config
 
 
+def _parse_bu_list(raw: str) -> list[str]:
+    """Parse comma-separated BU string into numeric codes.
+
+    "(185)亚信科技CMB,121" → ["185", "121"]
+    """
+    if not raw:
+        return ["185"]
+    raw = raw.replace("，", ",")
+    codes = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # Extract numeric code: e.g. "(185)亚信科技CMB" → "185", "121" → "121"
+        m = re.search(r'(\d+)', part)
+        if m:
+            codes.append(m.group(1))
+        else:
+            codes.append(part)
+    # Deduplicate preserving order
+    seen = set()
+    result = []
+    for c in codes:
+        if c not in seen:
+            seen.add(c)
+            result.append(c)
+    return result
+
+
 class IMSAutomator:
     def __init__(self):
         self.config = Config
 
-    def run(self) -> str | None:
-        """Execute full workflow and return path to downloaded export file."""
+    def run(self) -> list[str]:
+        """Execute full workflow and return list of downloaded file paths (one per BU)."""
         download_dir = os.path.abspath(self.config.DOWNLOAD_DIR)
         os.makedirs(download_dir, exist_ok=True)
+
+        bu_codes = _parse_bu_list(self.config.QUERY_BU)
+        print(f"[IMS] BU 列表: {bu_codes}")
+
+        file_paths = []
 
         with sync_playwright() as pw:
             browser: Browser = pw.chromium.launch(
@@ -35,7 +73,6 @@ class IMSAutomator:
                 self._login(page)
                 print("[IMS] 登录成功")
 
-                # Take screenshot for debugging
                 os.makedirs(download_dir, exist_ok=True)
                 page.screenshot(path=os.path.join(download_dir, "_debug_after_login.png"))
                 print("[IMS] 已保存截图: _debug_after_login.png")
@@ -45,20 +82,31 @@ class IMSAutomator:
                 page.screenshot(path=os.path.join(download_dir, "_debug_after_nav.png"))
                 print("[IMS] 已导航至人员面试评价表")
 
-                target_frame = self._find_table_frame(page)
-                if not target_frame:
-                    raise Exception("未找到人员面试评价表的内容区域（目标frame）")
+                # ── Loop per BU ──
+                for idx, bu_code in enumerate(bu_codes):
+                    print(f"\n[IMS] === BU [{idx + 1}/{len(bu_codes)}]: {bu_code} ===")
 
-                self._set_query_conditions(target_frame)
-                print("[IMS] 查询条件已设置")
+                    # Re-find frame (may have detached after previous operation)
+                    target = self._find_table_frame(page)
+                    if not target:
+                        raise Exception(f"未找到目标frame (BU={bu_code})")
 
-                self._click_query(target_frame)
-                print("[IMS] 查询完成")
-                time.sleep(3)
+                    self._set_query_conditions(target, bu_code)
+                    print(f"[IMS] 查询条件已设置 (BU={bu_code})")
 
-                filepath = self._click_export(page, target_frame)
-                print(f"[IMS] 导出完成: {filepath}")
-                return filepath
+                    self._click_query(target)
+                    print(f"[IMS] 查询完成 (BU={bu_code})")
+                    time.sleep(3)
+
+                    filepath = self._click_export(page, target, bu_code, idx)
+                    print(f"[IMS] 导出完成: {filepath}")
+                    file_paths.append(filepath)
+
+                    # Brief pause between BUs
+                    time.sleep(2)
+
+                print(f"\n[IMS] 全部导出完成，共 {len(file_paths)} 个文件")
+                return file_paths
 
             except Exception as e:
                 print(f"[IMS] 自动化出错: {e}")
@@ -116,12 +164,15 @@ class IMSAutomator:
         ]:
             btn = page.locator(sel)
             if btn.count() > 0:
-                btn.first.click()
+                # JS 原生 click 绕过 Playwright 导航追踪，避免 SSO 重定向超时
+                btn.first.evaluate("el => el.click()")
                 break
         else:
             if pwd_inputs:
                 pwd_inputs[0].press("Enter")
 
+        # SSO 重定向需要较长等待
+        page.wait_for_timeout(10000)
         self._wait_stable(page)
 
         if "登录" in page.title() or "login" in page.url.lower():
@@ -239,9 +290,17 @@ class IMSAutomator:
 
         return None
 
-    def _set_query_conditions(self, target: Frame | Page):
-        """Set query conditions: date range, status, BU."""
+    def _set_query_conditions(self, target: Frame | Page, bu_code: str = None):
+        """Set query conditions: date range, status, BU.
+
+        Args:
+            target: The frame or page containing the form.
+            bu_code: Numeric BU code like "185". If None, uses Config.QUERY_BU.
+        """
         self._wait_stable(target)
+
+        if bu_code is None:
+            bu_code = self.config.QUERY_BU
 
         today = date.today()
         start_date = today - timedelta(days=self.config.QUERY_DAYS_BACK)
@@ -250,7 +309,7 @@ class IMSAutomator:
 
         # Pass variables as arguments to avoid f-string escaping issues
         js = """
-        ([startStr, endStr]) => {
+        ([startStr, endStr, buCode]) => {
             // Set date inputs
             let inputs = document.querySelectorAll('input[type="text"]');
             let visible = [];
@@ -279,13 +338,13 @@ class IMSAutomator:
                 }
             }
 
-            // Set BU to "(185)亚信科技CMB" - exact match first
-            let buText = '(185)亚信科技CMB';
+            // Set BU — match by numeric code in parentheses, e.g. "(185)" or "(121)"
+            let buPattern = '(' + buCode + ')';
             let buFound = false;
             for (let s of selects) {
                 for (let o of s.options) {
                     let t = o.text.trim();
-                    if (t === buText) {
+                    if (t.includes(buPattern)) {
                         s.value = o.value;
                         s.dispatchEvent(new Event('change', {bubbles: true}));
                         try { if (typeof $ !== 'undefined') $(s).trigger('change'); } catch(e) {}
@@ -295,10 +354,12 @@ class IMSAutomator:
                 }
                 if (buFound) break;
             }
+            // Fallback: match option text that starts with the code
             if (!buFound) {
                 for (let s of selects) {
                     for (let o of s.options) {
-                        if (o.text.includes('(185)')) {
+                        if (o.text.trim().startsWith('(' + buCode + ')') ||
+                            o.text.trim().includes(buCode)) {
                             s.value = o.value;
                             s.dispatchEvent(new Event('change', {bubbles: true}));
                             buFound = true;
@@ -308,11 +369,13 @@ class IMSAutomator:
                     if (buFound) break;
                 }
             }
-            return 'dates=' + startStr + '~' + endStr + ' bu_ok=' + buFound + ' status_set=1';
+            return 'dates=' + startStr + '~' + endStr + ' bu=' + buCode + ' bu_ok=' + buFound + ' status_set=1';
         }
         """
-        result = target.evaluate(js, [start_str, end_str])
+        result = target.evaluate(js, [start_str, end_str, bu_code])
         print(f"[IMS] 条件设置: {result}")
+        if "bu_ok=false" in str(result).lower():
+            print(f"[IMS] 警告: 未找到 BU={bu_code} 的下拉选项，尝试继续...")
 
     def _click_query(self, target: Frame | Page):
         """Click the query button."""
@@ -346,8 +409,14 @@ class IMSAutomator:
             raise Exception("未找到查询按钮")
         time.sleep(5)
 
-    def _click_export(self, page: Page, target: Frame | Page) -> str | None:
-        """Click export button in the target frame and download."""
+    def _click_export(self, page: Page, target: Frame | Page,
+                      bu_code: str = "", idx: int = 0) -> str | None:
+        """Click export button in the target frame and download.
+
+        Args:
+            bu_code: BU code for unique filename.
+            idx: Index for unique filename.
+        """
         with page.expect_download(timeout=120000) as dl:
             js = """
             () => {
@@ -379,8 +448,14 @@ class IMSAutomator:
 
         download = dl.value
         suggested = download.suggested_filename
+        # Add BU suffix to filename to avoid overwrites
+        base, ext = os.path.splitext(suggested)
+        if bu_code:
+            unique_name = f"{base}_BU{bu_code}{ext}"
+        else:
+            unique_name = suggested
         download_dir = os.path.abspath(self.config.DOWNLOAD_DIR)
-        filepath = os.path.join(download_dir, suggested)
+        filepath = os.path.join(download_dir, unique_name)
         download.save_as(filepath)
         try:
             download.delete()
